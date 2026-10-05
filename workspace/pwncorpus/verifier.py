@@ -31,9 +31,22 @@ import sys
 
 _HASH_HEX = {"sha1": 40}
 
+# Fields covered by manifest_sha256 (the hash signs everything except itself).
+MANIFEST_FIELDS = ("version", "hash_algo", "prefix_len", "threshold_k",
+                   "created_at", "files")
+
 
 def _canonical(obj) -> str:
     return json.dumps(obj, sort_keys=True, separators=(",", ":"))
+
+
+def manifest_payload(manifest: dict) -> dict:
+    """The signed manifest content (everything except manifest_sha256)."""
+    return {f: manifest[f] for f in MANIFEST_FIELDS}
+
+
+def manifest_self_hash(manifest: dict) -> str:
+    return hashlib.sha256(_canonical(manifest_payload(manifest)).encode()).hexdigest()
 
 
 def _load_manifest(export_dir: str):
@@ -47,45 +60,73 @@ def _load_manifest(export_dir: str):
         return None, [f"unreadable manifest: {exc}"]
 
 
-def verify_export(export_dir: str) -> list[str]:
-    """Return a list of problems; empty list means the export is valid."""
+def check_manifest_fields(manifest) -> list[str]:
+    """Structural validation of a manifest object."""
     errors: list[str] = []
-    manifest, errs = _load_manifest(export_dir)
-    errors.extend(errs)
-    if manifest is None:
-        return errors
-
-    for field in ("version", "hash_algo", "prefix_len", "threshold_k",
-                  "created_at", "files", "manifest_sha256"):
+    if not isinstance(manifest, dict):
+        return ["manifest is not a JSON object"]
+    for field in MANIFEST_FIELDS + ("manifest_sha256",):
         if field not in manifest:
             errors.append(f"manifest missing field: {field}")
     if errors:
         return errors
-
-    algo = manifest["hash_algo"]
-    if algo not in _HASH_HEX:
-        errors.append(f"unsupported hash_algo: {algo}")
+    if manifest["hash_algo"] not in _HASH_HEX:
+        errors.append(f"unsupported hash_algo: {manifest['hash_algo']}")
         return errors
-    prefix_len = manifest["prefix_len"]
-    suffix_len = _HASH_HEX[algo] - prefix_len
+    if not isinstance(manifest["prefix_len"], int) or not (1 <= manifest["prefix_len"] < _HASH_HEX[manifest["hash_algo"]]):
+        errors.append(f"invalid prefix_len: {manifest['prefix_len']!r}")
+        return errors
     k = manifest["threshold_k"]
     if not isinstance(k, int) or k < 1:
         errors.append(f"invalid threshold_k: {k!r}")
         return errors
+    if not isinstance(manifest["files"], dict):
+        errors.append("manifest 'files' must be an object")
+    return errors
 
-    # 1. manifest self-integrity
-    payload = {f: manifest[f] for f in
-               ("version", "hash_algo", "prefix_len", "threshold_k", "created_at", "files")}
-    recomputed = hashlib.sha256(_canonical(payload).encode()).hexdigest()
-    if recomputed != manifest["manifest_sha256"]:
-        errors.append("manifest_sha256 does not match recomputed hash")
 
-    # 2. bucket files
+def check_bucket_bytes(raw: bytes, prefix: str, prefix_len: int,
+                       hash_algo: str, k: int) -> list[str]:
+    """Validate one bucket file's bytes: hash vs caller's manifest entry is
+    checked separately; here we cover encoding, line format, ordering,
+    uniqueness and the minimum set size."""
+    errors: list[str] = []
+    suffix_len = _HASH_HEX[hash_algo] - prefix_len
+    try:
+        text = raw.decode("ascii", "strict")
+    except UnicodeDecodeError:
+        return [f"bucket {prefix}: not ASCII"]
+    lines = text.split("\n")
+    if lines and lines[-1] == "":
+        lines.pop()
+    suffixes = []
+    for i, line in enumerate(lines, 1):
+        m = re.fullmatch(r"([0-9A-F]{%d}):([0-9]+)" % suffix_len, line)
+        if not m:
+            errors.append(f"bucket {prefix} line {i}: malformed entry")
+            continue
+        if int(m.group(2)) < 1:
+            errors.append(f"bucket {prefix} line {i}: count must be >= 1")
+        suffixes.append(m.group(1))
+    if len(suffixes) != len(set(suffixes)):
+        errors.append(f"bucket {prefix}: duplicate suffixes")
+    if suffixes != sorted(suffixes):
+        errors.append(f"bucket {prefix}: suffixes not in canonical order")
+    if 0 < len(suffixes) < k:
+        errors.append(
+            f"bucket {prefix}: set size {len(suffixes)} below threshold k={k}")
+    return errors
+
+
+def check_files_against_manifest(manifest: dict, export_dir: str) -> list[str]:
+    """Every bucket file must match its manifest hash / content rules, and
+    there must be no stray or missing files under buckets/."""
+    errors: list[str] = []
+    prefix_len = manifest["prefix_len"]
+    k = manifest["threshold_k"]
+    algo = manifest["hash_algo"]
     bdir = os.path.join(export_dir, "buckets")
     files = manifest["files"]
-    if not isinstance(files, dict):
-        errors.append("manifest 'files' must be an object")
-        return errors
 
     for prefix, expected_sha in sorted(files.items()):
         if not re.fullmatch(r"[0-9A-F]{%d}" % prefix_len, prefix or ""):
@@ -99,38 +140,41 @@ def verify_export(export_dir: str) -> list[str]:
             raw = fh.read()
         if hashlib.sha256(raw).hexdigest() != expected_sha:
             errors.append(f"bucket {prefix}: sha256 mismatch with manifest")
-        text = raw.decode("ascii", "strict")
-        lines = text.split("\n")
-        if lines and lines[-1] == "":
-            lines.pop()
-        suffixes = []
-        for i, line in enumerate(lines, 1):
-            m = re.fullmatch(r"([0-9A-F]{%d}):([0-9]+)" % suffix_len, line)
-            if not m:
-                errors.append(f"bucket {prefix} line {i}: malformed entry")
-                continue
-            if int(m.group(2)) < 1:
-                errors.append(f"bucket {prefix} line {i}: count must be >= 1")
-            suffixes.append(m.group(1))
-        if len(suffixes) != len(set(suffixes)):
-            errors.append(f"bucket {prefix}: duplicate suffixes")
-        if suffixes != sorted(suffixes):
-            errors.append(f"bucket {prefix}: suffixes not in canonical order")
-        if 0 < len(suffixes) < k:
-            errors.append(
-                f"bucket {prefix}: set size {len(suffixes)} below threshold k={k}")
+        errors.extend(check_bucket_bytes(raw, prefix, prefix_len, algo, k))
 
-    # 3. no stray files
     if os.path.isdir(bdir):
         for name in sorted(os.listdir(bdir)):
             stem = name[:-4] if name.endswith(".txt") else None
             if stem is None or stem not in files:
                 errors.append(f"unexpected file in buckets/: {name}")
-    else:
-        if files:
-            errors.append("missing buckets/ directory")
-
+    elif files:
+        errors.append("missing buckets/ directory")
     return errors
+
+
+def verify_manifest(manifest: dict, export_dir: str) -> list[str]:
+    """All offline checks for an already-loaded manifest: self hash, bucket
+    files, format rules, threshold and stray/missing files."""
+    errors = check_manifest_fields(manifest)
+    if errors:
+        return errors
+    if manifest_self_hash(manifest) != manifest["manifest_sha256"]:
+        errors.append("manifest_sha256 does not match recomputed hash")
+    errors.extend(check_files_against_manifest(manifest, export_dir))
+    return errors
+
+
+def load_manifest(export_dir: str):
+    """Public wrapper around the manifest loader: (manifest, errors)."""
+    return _load_manifest(export_dir)
+
+
+def verify_export(export_dir: str) -> list[str]:
+    """Return a list of problems; empty list means the export is valid."""
+    manifest, errs = _load_manifest(export_dir)
+    if manifest is None:
+        return errs
+    return verify_manifest(manifest, export_dir)
 
 
 def check_response(export_dir: str, prefix: str, response_path: str) -> list[str]:

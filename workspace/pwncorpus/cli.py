@@ -8,15 +8,20 @@
   python -m pwncorpus.cli activate --db corpus.db --version 3
   python -m pwncorpus.cli retract --db corpus.db --batch <id>
   python -m pwncorpus.cli export --db corpus.db --version 3 --out export-v3/
+  python -m pwncorpus.cli delta-generate --db corpus.db \
+      --from-version 2 --to-version 3 --out delta-v2-v3/
+  python -m pwncorpus.delta check delta-v2-v3/ [--baseline mirror/]
+  python -m pwncorpus.delta apply delta-v2-v3/ mirror/
   python -m pwncorpus.cli serve --db corpus.db --host 127.0.0.1 --port 8080
 """
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 
-from . import core, db
+from . import core, db, delta, verifier
 
 
 def _conn(args):
@@ -65,6 +70,16 @@ def main(argv=None) -> int:
     p = sub.add_parser("export", help="export a version for offline verification")
     p.add_argument("--version", type=int, required=True)
     p.add_argument("--out", required=True)
+
+    p = sub.add_parser("delta-generate",
+                       help="build a verifiable incremental package between two"
+                       " stored releases (offline hosts can also use"
+                       " 'python -m pwncorpus.delta build' on two exports)")
+    p.add_argument("--from-version", type=int, required=True,
+                   help="baseline release already present in the mirror")
+    p.add_argument("--to-version", type=int, required=True,
+                   help="target release")
+    p.add_argument("--out", required=True, help="output delta package directory")
 
     p = sub.add_parser("status", help="show publications and batch stats")
 
@@ -150,6 +165,25 @@ def main(argv=None) -> int:
                   f"manifest {manifest['manifest_sha256'][:16]}...)")
             return 0
 
+        if args.cmd == "delta-generate":
+            import tempfile
+            with tempfile.TemporaryDirectory(prefix="pwncorpus-delta-") as tmp:
+                fdir = os.path.join(tmp, "from")
+                tdir = os.path.join(tmp, "to")
+                core.export_version(conn, args.from_version, fdir)
+                core.export_version(conn, args.to_version, tdir)
+                if verifier.verify_export(fdir) or verifier.verify_export(tdir):
+                    raise core.CorpusError(
+                        "internal export failed verification; aborting delta build")
+                meta = delta.build_delta(fdir, tdir, args.out)
+            s = delta.delta_summary(meta)
+            print(f"built delta v{s['from_version']} -> v{s['to_version']} "
+                  f"in {args.out} "
+                  f"(added {s['buckets_added']}, modified {s['buckets_modified']},"
+                  f" deleted {s['buckets_deleted']}, unchanged "
+                  f"{s['buckets_unchanged']} buckets)")
+            return 0
+
         if args.cmd == "status":
             state = core.review_state(conn)
             print(json.dumps({
@@ -160,6 +194,9 @@ def main(argv=None) -> int:
             }, indent=2))
             return 0
     except core.CorpusError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    except delta.DeltaError as exc:  # delta-generate validation failures
         print(f"error: {exc}", file=sys.stderr)
         return 1
     finally:
