@@ -6,6 +6,7 @@ control; every module reads it at call time, so server + core stay consistent.
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import os
 import shutil
@@ -17,8 +18,9 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import redirect_stdout
 
-from pwncorpus import core, db, server, verifier
+from pwncorpus import cli, core, db, delta, server, verifier
 
 core.PREFIX_LEN = 2  # test-only: 256 buckets instead of 1M
 
@@ -711,6 +713,217 @@ class ServerCase(unittest.TestCase):
         self.assertEqual(st, 200)
         _, health, _ = self.http("GET", "/api/health")
         self.assertEqual(health["active_version"], v2)
+
+
+def tree_snapshot(root):
+    """Map of relative path -> sha256 for every file under root."""
+    snap = {}
+    for dirpath, _dirnames, filenames in os.walk(root):
+        for name in filenames:
+            p = os.path.join(dirpath, name)
+            with open(p, "rb") as fh:
+                snap[os.path.relpath(p, root)] = hashlib.sha256(fh.read()).hexdigest()
+    return snap
+
+
+class DeltaCase(unittest.TestCase):
+    """Delta packages: generate / check / apply between two publications."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="pwncorpus-delta-test-")
+        self.db_path = os.path.join(self.tmp, "corpus.db")
+        db.init(self.db_path)
+        self.conn = db.connect(self.db_path)
+        self.addCleanup(self.conn.close)
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+
+    def publish(self, k=2):
+        info = core.build_candidate(self.conn, k)
+        core.activate(self.conn, info["version"])
+        return info["version"]
+
+    def make_two_versions(self):
+        """v1: buckets AA, BB, CC. v2: AA unchanged, BB modified (grew),
+        CC removed (retracted), DD added."""
+        core.ingest_batch(self.conn, "batch-a", pw_with_prefix("AA", 2, tag="a"))
+        core.ingest_batch(self.conn, "batch-b", pw_with_prefix("BB", 2, tag="b"))
+        bc = core.ingest_batch(self.conn, "batch-c", pw_with_prefix("CC", 2, tag="c"))
+        v1 = self.publish(k=2)
+        core.ingest_batch(self.conn, "batch-b2", pw_with_prefix("BB", 2, tag="b2"))
+        core.ingest_batch(self.conn, "batch-d", pw_with_prefix("DD", 2, tag="d"))
+        core.retract_batch(self.conn, bc["batch_id"])
+        v2 = self.publish(k=2)
+        return v1, v2
+
+    def export(self, version, name):
+        out = os.path.join(self.tmp, name)
+        core.export_version(self.conn, version, out)
+        return out
+
+    def make_mirror(self, export_dir, name="mirror"):
+        mirror = os.path.join(self.tmp, name)
+        shutil.copytree(export_dir, mirror)
+        return mirror
+
+    # -- tests -------------------------------------------------------------
+    def test_delta_roundtrip_matches_full_export(self):
+        v1, v2 = self.make_two_versions()
+        exp1, exp2 = self.export(v1, "exp1"), self.export(v2, "exp2")
+        ddir = os.path.join(self.tmp, "delta")
+        package = delta.export_delta(self.conn, v1, v2, ddir)
+
+        # the package binds both manifests and declares the bucket diff
+        self.assertEqual(delta.check_delta(ddir), [])
+        self.assertEqual(package["base"]["version"], v1)
+        self.assertEqual(package["target"]["version"], v2)
+        self.assertEqual(set(package["added"]), {"DD"})
+        self.assertEqual(set(package["changed"]), {"BB"})
+        self.assertEqual(package["removed"], ["CC"])
+        self.assertEqual(package["base"]["manifest_sha256"],
+                         json.load(open(os.path.join(exp1, "manifest.json")))
+                         ["manifest_sha256"])
+
+        mirror = self.make_mirror(exp1)
+        result = delta.apply_delta(mirror, ddir)
+        self.assertEqual(result["status"], "applied")
+        self.assertEqual((result["from_version"], result["to_version"]), (v1, v2))
+        # the applied mirror equals a full export of the target, byte for byte
+        self.assertEqual(tree_snapshot(mirror), tree_snapshot(exp2))
+        self.assertEqual(verifier.verify_export(mirror), [])
+
+    def test_delta_reapply_is_noop(self):
+        v1, v2 = self.make_two_versions()
+        exp1, exp2 = self.export(v1, "exp1"), self.export(v2, "exp2")
+        ddir = os.path.join(self.tmp, "delta")
+        delta.export_delta(self.conn, v1, v2, ddir)
+        mirror = self.make_mirror(exp1)
+        delta.apply_delta(mirror, ddir)
+        before = tree_snapshot(mirror)
+        result = delta.apply_delta(mirror, ddir)  # same delta again
+        self.assertEqual(result["status"], "already-applied")
+        self.assertEqual(tree_snapshot(mirror), before)
+        self.assertEqual(tree_snapshot(mirror), tree_snapshot(exp2))
+        self.assertEqual(verifier.verify_export(mirror), [])
+
+    def test_delta_baseline_mismatch_keeps_mirror(self):
+        v1, v2 = self.make_two_versions()
+        # a third version the delta does NOT start from
+        core.ingest_batch(self.conn, "batch-e", pw_with_prefix("EE", 2, tag="e"))
+        v3 = self.publish(k=2)
+        exp3 = self.export(v3, "exp3")
+        ddir = os.path.join(self.tmp, "delta")
+        delta.export_delta(self.conn, v1, v2, ddir)
+
+        mirror = self.make_mirror(exp3)
+        before = tree_snapshot(mirror)
+        with self.assertRaises(delta.DeltaError) as ctx:
+            delta.apply_delta(mirror, ddir)
+        self.assertIn("baseline mismatch", str(ctx.exception))
+        # the mirror is untouched and still passes the plain verifier
+        self.assertEqual(tree_snapshot(mirror), before)
+        self.assertEqual(verifier.verify_export(mirror), [])
+
+    def test_delta_tampered_package_rejected(self):
+        v1, v2 = self.make_two_versions()
+        exp1 = self.export(v1, "exp1")
+        ddir = os.path.join(self.tmp, "delta")
+        delta.export_delta(self.conn, v1, v2, ddir)
+
+        # tamper with a shipped bucket file
+        mirror = self.make_mirror(exp1)
+        before = tree_snapshot(mirror)
+        f = os.path.join(ddir, "buckets", "BB.txt")
+        lines = open(f).read().splitlines()
+        s, c = lines[0].split(":")
+        lines[0] = f"{s}:{int(c) + 100}"
+        open(f, "w").write("\n".join(lines) + "\n")
+        with self.assertRaises(delta.DeltaError) as ctx:
+            delta.apply_delta(mirror, ddir)
+        self.assertIn("delta package invalid", str(ctx.exception))
+        self.assertEqual(tree_snapshot(mirror), before)
+        self.assertEqual(verifier.verify_export(mirror), [])
+
+        # tamper with the declared diff in delta.json
+        ddir2 = os.path.join(self.tmp, "delta2")
+        delta.export_delta(self.conn, v1, v2, ddir2)
+        mpath = os.path.join(ddir2, "delta.json")
+        package = json.load(open(mpath))
+        package["removed"] = []
+        json.dump(package, open(mpath, "w"))
+        with self.assertRaises(delta.DeltaError):
+            delta.apply_delta(mirror, ddir2)
+        self.assertTrue(any("removed" in e for e in delta.check_delta(ddir2)))
+        self.assertEqual(tree_snapshot(mirror), before)
+        self.assertEqual(verifier.verify_export(mirror), [])
+
+    def test_delta_missing_bucket_file_rejected(self):
+        v1, v2 = self.make_two_versions()
+        exp1 = self.export(v1, "exp1")
+        ddir = os.path.join(self.tmp, "delta")
+        delta.export_delta(self.conn, v1, v2, ddir)
+        os.remove(os.path.join(ddir, "buckets", "DD.txt"))  # incomplete package
+
+        mirror = self.make_mirror(exp1)
+        before = tree_snapshot(mirror)
+        with self.assertRaises(delta.DeltaError) as ctx:
+            delta.apply_delta(mirror, ddir)
+        self.assertIn("missing bucket file", str(ctx.exception))
+        self.assertEqual(tree_snapshot(mirror), before)
+        self.assertEqual(verifier.verify_export(mirror), [])
+
+    def test_delta_interrupted_write_keeps_mirror(self):
+        from unittest import mock
+        v1, v2 = self.make_two_versions()
+        exp1 = self.export(v1, "exp1")
+        ddir = os.path.join(self.tmp, "delta")
+        delta.export_delta(self.conn, v1, v2, ddir)
+        mirror = self.make_mirror(exp1)
+        before = tree_snapshot(mirror)
+
+        calls = {"n": 0}
+        real_copy = shutil.copyfile
+
+        def flaky_copy(src, dst):
+            calls["n"] += 1
+            if calls["n"] == 2:  # die while writing the second staged bucket
+                raise OSError("simulated write interruption")
+            return real_copy(src, dst)
+
+        # staged target buckets, sorted: AA (linked from mirror), then the
+        # rewritten BB and DD are copied - the second copy dies mid-write
+        with mock.patch.object(delta.shutil, "copyfile", flaky_copy):
+            with self.assertRaises(delta.DeltaError) as ctx:
+                delta.apply_delta(mirror, ddir)
+        self.assertIn("interrupted", str(ctx.exception))
+        # staging is cleaned up; the mirror is byte-for-byte intact
+        self.assertFalse(os.path.exists(mirror + ".delta-staging"))
+        self.assertFalse(os.path.exists(mirror + ".delta-backup"))
+        self.assertEqual(tree_snapshot(mirror), before)
+        self.assertEqual(verifier.verify_export(mirror), [])
+
+    def test_delta_cli_entries(self):
+        v1, v2 = self.make_two_versions()
+        exp1, exp2 = self.export(v1, "exp1"), self.export(v2, "exp2")
+        ddir = os.path.join(self.tmp, "delta")
+        with redirect_stdout(io.StringIO()):
+            rc = cli.main(["--db", self.db_path, "delta",
+                           "--from-version", str(v1), "--to-version", str(v2),
+                           "--out", ddir])
+        self.assertEqual(rc, 0)
+        with redirect_stdout(io.StringIO()):
+            self.assertEqual(verifier.main(["delta-check", ddir]), 0)
+        mirror = self.make_mirror(exp1)
+        with redirect_stdout(io.StringIO()):
+            self.assertEqual(verifier.main(["delta-apply", mirror, ddir]), 0)
+            self.assertEqual(verifier.main(["verify", mirror]), 0)
+        self.assertEqual(tree_snapshot(mirror), tree_snapshot(exp2))
+        # a failing apply exits non-zero with a clear error
+        with redirect_stdout(io.StringIO()):
+            self.assertEqual(verifier.main(["delta-apply", mirror, ddir]), 0)  # noop
+        bad = os.path.join(self.tmp, "not-a-delta")
+        os.makedirs(bad)
+        with redirect_stdout(io.StringIO()):
+            self.assertEqual(verifier.main(["delta-apply", mirror, bad]), 1)
 
 
 if __name__ == "__main__":

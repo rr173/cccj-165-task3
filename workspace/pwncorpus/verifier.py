@@ -13,11 +13,14 @@ without any network access:
 Also supports:
   * verifying that a live API range response matches a published bucket file
   * fully offline password lookup against an export (k-anonymity locally)
+  * checking and applying delta packages (incremental mirror updates)
 
 Usage:
   python -m pwncorpus.verifier verify EXPORT_DIR
   python -m pwncorpus.verifier check-response EXPORT_DIR PREFIX RESPONSE_FILE
   python -m pwncorpus.verifier lookup EXPORT_DIR [--password PW]
+  python -m pwncorpus.verifier delta-check DELTA_DIR
+  python -m pwncorpus.verifier delta-apply EXPORT_DIR DELTA_DIR
 """
 from __future__ import annotations
 
@@ -29,7 +32,8 @@ import os
 import re
 import sys
 
-_HASH_HEX = {"sha1": 40}
+HASH_HEX = {"sha1": 40}
+_HASH_HEX = HASH_HEX  # backwards-compatible alias
 
 
 def _canonical(obj) -> str:
@@ -185,6 +189,13 @@ def main(argv=None) -> int:
     p.add_argument("export_dir")
     p.add_argument("--password", default=None,
                    help="password to check (omit for an interactive, hidden prompt)")
+    p = sub.add_parser("delta-check",
+                       help="verify the integrity of a delta package")
+    p.add_argument("delta_dir")
+    p = sub.add_parser("delta-apply",
+                       help="atomically apply a delta package to a local mirror")
+    p.add_argument("export_dir")
+    p.add_argument("delta_dir")
     args = ap.parse_args(argv)
 
     if args.cmd == "verify":
@@ -212,6 +223,34 @@ def main(argv=None) -> int:
             print(f"FOUND: seen {count} time(s) in the corpus - change this password")
             return 2
         print("not found in this publication")
+        return 0
+    if args.cmd == "delta-check":
+        from . import delta  # lazy: keeps the plain verifier dependency-free
+        problems = delta.check_delta(args.delta_dir)
+        if problems:
+            for e in problems:
+                print(f"FAIL: {e}", file=sys.stderr)
+            return 1
+        package = delta._load_json(os.path.join(args.delta_dir, "delta.json"))
+        print(f"OK: delta v{package['base']['version']} -> "
+              f"v{package['target']['version']}, "
+              f"+{len(package['added'])} ~{len(package['changed'])} "
+              f"-{len(package['removed'])} buckets, "
+              f"delta {package['delta_sha256'][:16]}...")
+        return 0
+    if args.cmd == "delta-apply":
+        from . import delta
+        try:
+            result = delta.apply_delta(args.export_dir, args.delta_dir)
+        except delta.DeltaError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+        if result["status"] == "already-applied":
+            print(f"OK: mirror already at version {result['version']};"
+                  " nothing to do")
+        else:
+            print(f"OK: mirror advanced v{result['from_version']} ->"
+                  f" v{result['to_version']}")
         return 0
     return 1  # pragma: no cover
 

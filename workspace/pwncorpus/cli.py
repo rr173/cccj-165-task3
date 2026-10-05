@@ -8,6 +8,7 @@
   python -m pwncorpus.cli activate --db corpus.db --version 3
   python -m pwncorpus.cli retract --db corpus.db --batch <id>
   python -m pwncorpus.cli export --db corpus.db --version 3 --out export-v3/
+  python -m pwncorpus.cli delta --db corpus.db --from-version 2 --to-version 3 --out delta-2-3/
   python -m pwncorpus.cli serve --db corpus.db --host 127.0.0.1 --port 8080
 """
 from __future__ import annotations
@@ -16,7 +17,7 @@ import argparse
 import json
 import sys
 
-from . import core, db
+from . import core, db, delta
 
 
 def _conn(args):
@@ -64,6 +65,12 @@ def main(argv=None) -> int:
 
     p = sub.add_parser("export", help="export a version for offline verification")
     p.add_argument("--version", type=int, required=True)
+    p.add_argument("--out", required=True)
+
+    p = sub.add_parser("delta", help="generate a verifiable delta package "
+                       "between two published versions (for offline mirrors)")
+    p.add_argument("--from-version", type=int, required=True)
+    p.add_argument("--to-version", type=int, required=True)
     p.add_argument("--out", required=True)
 
     p = sub.add_parser("status", help="show publications and batch stats")
@@ -150,6 +157,15 @@ def main(argv=None) -> int:
                   f"manifest {manifest['manifest_sha256'][:16]}...)")
             return 0
 
+        if args.cmd == "delta":
+            package = delta.export_delta(conn, args.from_version,
+                                         args.to_version, args.out)
+            print(f"delta v{args.from_version} -> v{args.to_version} written to"
+                  f" {args.out} (+{len(package['added'])}"
+                  f" ~{len(package['changed'])} -{len(package['removed'])}"
+                  f" buckets, delta {package['delta_sha256'][:16]}...)")
+            return 0
+
         if args.cmd == "status":
             state = core.review_state(conn)
             print(json.dumps({
@@ -159,7 +175,7 @@ def main(argv=None) -> int:
                 "stats": state["stats"],
             }, indent=2))
             return 0
-    except core.CorpusError as exc:
+    except (core.CorpusError, delta.DeltaError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
     finally:
